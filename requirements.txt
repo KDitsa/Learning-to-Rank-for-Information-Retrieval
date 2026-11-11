@@ -1,0 +1,8 @@
+nltk
+xgboost
+lightgbm 
+optuna 
+joblib 
+pandas
+numpy
+scikit-learn

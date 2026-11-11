@@ -1,0 +1,4 @@
+model/model_comparison/ranked_test_documents.csv
+data/features/
+lambdamart_query_results.txt
+__pycache__
