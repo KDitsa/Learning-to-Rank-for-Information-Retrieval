@@ -57,13 +57,17 @@ The collection contains:
 
 ### Relevance Labels
 
-The qrels file provides the ground-truth relevance judgments used to train and evaluate the ranking models.
+The original Cranfield judgments use codes 1 to 4, where **1 is the most relevant** (a complete answer) and 4 is the least (minimum interest). Because ranking metrics and the models treat larger values as more relevant, the labels are remapped in `build_dataset.py`:
 
-Cranfield codes 1–4 (1 = most relevant) are remapped to 4–1 so higher means more relevant; code -1 get 0.
+| Original code | Meaning | Label used |
+|---:|---|---:|
+| 1 | Complete answer | 4 |
+| 2 | High degree of relevance | 3 |
+| 3 | Useful background | 2 |
+| 4 | Minimum interest | 1 |
+| -1 / unjudged | Not relevant | 0 |
 
-**Unjudged documents:** Query-document pairs without an explicit relevance judgment are assigned a relevance label of `0` during dataset construction.
-
-This is an experimental assumption that treats unjudged documents as non-relevant. Its potential effect on training and evaluation should be considered when interpreting the results.
+**Unjudged documents:** query-document pairs without a judgment are assigned label `0`. This is an experimental assumption that treats unjudged documents as non-relevant, and it may affect both training and evaluation.
 
 ---
 
@@ -364,97 +368,104 @@ Then proceed to model evaluation and comparison using `compare_models.py`.
 python compare_models.py
 ```
 
-The comparison script:
+The script:
 
 1. Loads the three trained models.
-2. Evaluates them on the same held-out test queries.
-3. Calculates the ranking metrics.
-4. Compares their performance.
-5. Ranks the models based on test NDCG@10.
-6. Generates comparison reports.
+2. Rebuilds the same held-out test queries (query-level 80/20 split, `random_state=42`).
+3. Scores the test documents with each model **and with a BM25 baseline**.
+4. Computes the ranking metrics for every ranker.
+5. Runs paired Wilcoxon signed-rank tests on per-query results.
 
-### 8.1 Evaluation Metrics
+### 8.1 BM25 Baseline
+
+The baseline ranks documents by the whole-document BM25 feature alone (`whole_document_bm25`), with no learning. It uses the same test queries and the same evaluation code as the learned models, so it shows how much learning adds over a strong lexical retrieval function.
+
+### 8.2 Evaluation Metrics
 
 | Metric | Description |
 |---|---|
 | MAP | Mean Average Precision |
 | MRR | Mean Reciprocal Rank |
-| P@5 | Precision at 5 |
-| P@10 | Precision at 10 |
-| Recall@5 | Recall at 5 |
-| Recall@10 | Recall at 10 |
-| nDCG@5 | Normalized Discounted Cumulative Gain at 5 |
-| nDCG@10 | Normalized Discounted Cumulative Gain at 10 |
-| Pairwise Accuracy | Proportion of document pairs correctly ordered |
+| P@5, P@10 | Precision at 5 and 10 |
+| Recall@5, Recall@10 | Recall at 5 and 10 |
+| nDCG@5, nDCG@10 | Normalized Discounted Cumulative Gain |
+| Pairwise Accuracy | Proportion of document pairs with different labels that are ordered correctly |
 
-For MAP, MRR, Precision, and Recall, relevance is treated as binary:
+For MAP, MRR, Precision and Recall, relevance is binary (`relevance > 0`). For nDCG, the graded labels (0 to 4) are used.
 
-```python
-relevant = relevance > 0
-```
+**Tie-breaking:** when documents receive equal scores, the less relevant document is ranked first (pessimistic tie-breaking). This matters on Cranfield, where many documents share no terms with a query and score identically (about 36% of test rows have a BM25 score of 0). Ties therefore never inflate the results.
 
-For nDCG, the original graded relevance labels are used.
+### 8.3 Results on the Held-Out Test Queries (45 queries, 63,000 query-document pairs)
 
-### 8.2 Model Comparison Results
-
-The following table shows the performance of the three models on the held-out test set.
-
-| Rank | Model | MAP | MRR | P@5 | P@10 | Recall@5 | Recall@10 | nDCG@5 | nDCG@10 | Pairwise Accuracy |
+| Rank | Ranker | MAP | MRR | P@5 | P@10 | Recall@5 | Recall@10 | nDCG@5 | nDCG@10 | Pairwise Acc. |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | LightGBM LambdaMART | 0.3785 | 0.6568 | 0.4222 | **0.2911** | 0.3693 | **0.4952** | 0.4396 | **0.4695** | 0.9146 |
-| 2 | XGBoost Rank:Pairwise | **0.3823** | **0.6849** | **0.4222** | 0.2756 | **0.3934** | 0.4734 | **0.4551** | 0.4628 | **0.9227** |
-| 3 | Linear SVM | 0.3772 | 0.6712 | 0.3822 | 0.2733 | 0.3544 | 0.4707 | 0.4129 | 0.4479 | 0.9197 |
+| 1 | LightGBM LambdaMART | 0.3784 | 0.6568 | **0.4222** | **0.2911** | 0.3693 | **0.4952** | 0.4396 | **0.4695** | 0.9146 |
+| 2 | XGBoost Rank:Pairwise | **0.3821** | **0.6849** | **0.4222** | 0.2756 | **0.3934** | 0.4734 | **0.4551** | 0.4628 | **0.9227** |
+| 3 | BM25 (baseline) | 0.3776 | 0.6297 | 0.3778 | 0.2756 | 0.3792 | 0.4669 | 0.4262 | 0.4560 | 0.9161 |
+| 4 | Linear SVM | 0.3772 | 0.6712 | 0.3822 | 0.2733 | 0.3544 | 0.4707 | 0.4129 | 0.4479 | 0.9197 |
 
-*Values are rounded to four decimal places.*
+*Rows are ordered by nDCG@10. The best value in each column is in bold.*
 
-### 8.3 Result Analysis
+### 8.4 Statistical Significance (paired Wilcoxon signed-rank test)
 
-The experimental results show that the three models achieve relatively comparable ranking performance, with different strengths across the evaluation metrics.
+Per-query nDCG@10 and MAP are compared with a paired Wilcoxon signed-rank test over the 45 test queries (`significance_tests.csv`).
 
-**LightGBM LambdaMART:**
+**nDCG@10**
 
-- Achieves the highest P@10.
-- Achieves the highest Recall@10.
-- Achieves the highest nDCG@10.
-- Provides strong overall top-10 ranking performance.
+| Comparison (A vs B) | Mean difference (A - B) | Queries A better / B better / tied | p-value | Significant at 0.05 |
+|---|---:|:---:|---:|:---:|
+| LightGBM LambdaMART vs BM25 | +0.0135 | 21 / 16 / 8 | 0.455 | No |
+| XGBoost Rank:Pairwise vs BM25 | +0.0068 | 20 / 17 / 8 | 0.603 | No |
+| Linear SVM vs BM25 | -0.0081 | 19 / 16 / 10 | 0.974 | No |
+| LightGBM LambdaMART vs XGBoost Rank:Pairwise | +0.0067 | 19 / 18 / 8 | 0.712 | No |
+| LightGBM LambdaMART vs Linear SVM | +0.0216 | 21 / 13 / 11 | 0.153 | No |
+| XGBoost Rank:Pairwise vs Linear SVM | +0.0149 | 22 / 12 / 11 | 0.074 | No |
 
-**XGBoost Rank:Pairwise:**
+**MAP**
 
-- Achieves the highest MAP and MRR.
-- Achieves the highest Recall@5.
-- Achieves the highest nDCG@5.
-- Achieves the highest pairwise accuracy.
+| Comparison (A vs B) | Mean difference (A - B) | Queries A better / B better / tied | p-value | Significant at 0.05 |
+|---|---:|:---:|---:|:---:|
+| LightGBM LambdaMART vs BM25 | +0.0007 | 25 / 18 / 2 | 0.507 | No |
+| XGBoost Rank:Pairwise vs BM25 | +0.0045 | 27 / 17 / 1 | 0.318 | No |
+| Linear SVM vs BM25 | -0.0004 | 22 / 20 / 3 | 0.703 | No |
+| LightGBM LambdaMART vs XGBoost Rank:Pairwise | +0.0037 | 18 / 24 / 3 | 0.544 | No |
+| LightGBM LambdaMART vs Linear SVM | +0.0012 | 19 / 24 / 2 | 0.837 | No |
+| XGBoost Rank:Pairwise vs Linear SVM | +0.0049 | 25 / 18 / 2 | 0.378 | No |
 
-**Pairwise Linear SVM:**
+*p-values are not corrected for multiple comparisons. No difference is significant even without correction.*
 
-- Provides a competitive baseline.
-- Achieves lower scores than the two tree-based ranking models across most metrics.
+### 8.5 Result Analysis
 
-### 8.4 Final Model Selection
+- **No learned model significantly outperforms BM25.** LightGBM LambdaMART has the highest nDCG@10 (0.4695 vs 0.4560 for BM25), but the gain of 0.0135 is not statistically significant (p = 0.455). The same holds for XGBoost and for MAP, where all four rankers are within 0.005 of each other.
+- **The learned models differ little from one another.** The largest nDCG@10 gap is between XGBoost and the Linear SVM (+0.0149, p = 0.074), which comes closest to significance but does not reach it.
+- **Where the tree models show an edge.** Both boosted models have a higher P@5 than BM25 (0.4222 vs 0.3778) and a higher nDCG@5 (0.4396 and 0.4551 vs 0.4262). This is the largest observed gap, but it was not tested for significance, so it should be treated as a possible trend only.
+- **LightGBM LambdaMART** leads on P@10, Recall@10 and nDCG@10, which are the top-10 metrics.
+- **XGBoost Rank:Pairwise** leads on MAP, MRR, Recall@5, nDCG@5 and pairwise accuracy.
+- **Linear SVM** performs about the same as BM25, with no consistent advantage. It scores above BM25 on some metrics (MRR, P@5, Recall@10) and below on others (MAP, nDCG@5, nDCG@10).
+- **Pairwise accuracy is not informative here.** All rankers score about 0.91 to 0.92, including BM25, because most of the counted pairs are relevant-vs-irrelevant pairs that are easy to order.
+- **Why the gains are small.** Cranfield is small, BM25 is a strong baseline on it, and many of the 110 features are themselves BM25 or TF-IDF variants, so the learned models start with little extra signal beyond what BM25 already captures.
 
-Although XGBoost performs best on several individual metrics, **LightGBM LambdaMART is selected as the final model for the search application**.
+### 8.6 Final Model Selection
 
-The selection is based primarily on its higher test nDCG@10, along with its higher P@10 and Recall@10.
+LightGBM LambdaMART is used in the search application because it has the highest test nDCG@10 among the learned models and the best top-10 precision and recall. The margin over XGBoost (p = 0.712) and over BM25 (p = 0.455) is not statistically significant, so the choice is a practical one rather than evidence that LambdaMART is better. Selecting on the test set is also a limitation. The cross-validation scores stored in each model's metadata (`best_cv_ndcg_at_10` and the equivalents) are the more appropriate basis for selection.
 
-Since the final application retrieves a ranked list of documents, ranking quality across the top 10 results is particularly relevant.
-
-The trained LambdaMART model is therefore used by `main.py` for document retrieval and ranking.
-
-**Evaluation note:** Cross-validation results should guide hyperparameter tuning and model selection. The held-out test set should be reserved for final performance evaluation rather than repeatedly used to make tuning decisions.
-
-### 8.5 Generated Evaluation Outputs
-
-The comparison script generates the following reports:
+### 8.7 Generated Outputs
 
 ```text
-model_comparison.csv
-per_query_metrics.csv
-ranked_test_documents.csv
+model/model_comparison/
+├── model_comparison.csv       # mean metrics per ranker, including BM25
+├── per_query_metrics.csv      # per-query metrics for every ranker
+├── significance_tests.csv     # paired Wilcoxon results
+└── ranked_test_documents.csv  # ranked test documents (large; not committed)
 ```
 
-These files contain the overall model comparison, per-query evaluation metrics, and ranked test documents.
+### 8.8 Limitations
 
----
+- **Small test set:** one query-level split with 45 test queries. A different split could change the ranking of the models. Repeated splits or nested cross-validation would give more reliable estimates.
+- **Unjudged = non-relevant:** unjudged documents are labeled 0, which may penalize rankers that retrieve relevant but unjudged documents.
+- **Baseline definition:** the baseline uses the project's own whole-document BM25 feature, not an independently tuned BM25 implementation.
+- **Multiple comparisons:** the reported p-values are uncorrected, and only nDCG@10 and MAP were tested.
+- **Model selection on the test set:** the final model was chosen using test nDCG@10, although the differences are within noise.
 
 ## 9. Running the Search Application
 
@@ -566,6 +577,7 @@ Several extensions could further improve the system:
 | LightGBM | LambdaMART ranking |
 | Optuna | Hyperparameter optimization |
 | Joblib | Model serialization |
+| SciPy | Paired Wilcoxon significance tests
 
 ---
 

@@ -3,6 +3,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from scipy.stats import wilcoxon
 from sklearn.model_selection import GroupShuffleSplit
 
 
@@ -24,11 +25,31 @@ MODELS = {
     },
 }
 
+# BM25 baseline: the whole-document BM25 feature used on its own as the ranking score.
+BASELINE_NAME = "BM25 (baseline)"
+BASELINE_FEATURE = "whole_document_bm25"
+
 OUTPUT_DIR = BASE_DIR / "model" / "model_comparison"
 
 TEST_SIZE = 0.20
 RANDOM_STATE = 42
 EXPECTED_FEATURES = 110
+ALPHA = 0.05
+
+METRICS = [
+    "MAP",
+    "MRR",
+    "P@5",
+    "P@10",
+    "Recall@5",
+    "Recall@10",
+    "nDCG@5",
+    "nDCG@10",
+    "pairwise_accuracy",
+]
+
+# Metrics used for the paired significance tests.
+TEST_METRICS = ["nDCG@10", "MAP"]
 
 
 def load_dataset():
@@ -62,6 +83,11 @@ def load_dataset():
     if len(features) != EXPECTED_FEATURES:
         raise ValueError(
             f"Expected {EXPECTED_FEATURES} features, found {len(features)}"
+        )
+
+    if BASELINE_FEATURE not in features:
+        raise ValueError(
+            f"Baseline feature '{BASELINE_FEATURE}' not found in dataset."
         )
 
     df[features] = df[features].apply(
@@ -103,18 +129,21 @@ def get_feature_columns(model, metadata_path, dataset_features):
         with open(metadata_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
 
+    def empty(x):
+        return x is None or len(x) == 0
+
     features = metadata.get("feature_columns")
 
-    if not features:
+    if empty(features):
         features = getattr(model, "feature_names_in_", None)
 
-    if not features and hasattr(model, "booster_"):
+    if empty(features) and hasattr(model, "booster_"):
         features = model.booster_.feature_name()
 
-    if not features and hasattr(model, "get_booster"):
+    if empty(features) and hasattr(model, "get_booster"):
         features = model.get_booster().feature_names
 
-    if not features:
+    if empty(features):
         features = dataset_features
 
     features = list(features)
@@ -225,14 +254,15 @@ def evaluate_model(test_df, scores, model_name):
     ranked_results = []
 
     for qid, group in df.groupby("qid", sort=False):
-        ranked = group.sort_values(
-            ["score", "docid"],
-            ascending=[False, True],
-            kind="mergesort"
-        )
+        score_q = group["score"].to_numpy()
+        original_relevances = group["relevance"].to_numpy()
+
+        # Pessimistic tie-breaking: higher score first; among equal scores,
+        # LOWER relevance first, so ties never help the ranker.
+        order = np.lexsort((original_relevances, -score_q))
+        ranked = group.iloc[order]
 
         relevances = ranked["relevance"].to_numpy()
-        original_relevances = group["relevance"].to_numpy()
 
         total_relevant = np.sum(original_relevances > 0)
 
@@ -244,7 +274,7 @@ def evaluate_model(test_df, scores, model_name):
             "nDCG@10": ndcg_at_k(relevances, 10),
             "pairwise_accuracy": pairwise_accuracy(
                 original_relevances,
-                group["score"].to_numpy()
+                score_q
             )
         }
 
@@ -273,6 +303,54 @@ def evaluate_model(test_df, scores, model_name):
     )
 
 
+def paired_wilcoxon_tests(per_query_all, model_names):
+    """
+    Paired Wilcoxon signed-rank tests on per-query metrics.
+    Each ranker is compared with the BM25 baseline, and
+    the learned rankers are compared with each other.
+    """
+    pairs = [(m, BASELINE_NAME) for m in model_names]
+    for i in range(len(model_names)):
+        for j in range(i + 1, len(model_names)):
+            pairs.append((model_names[i], model_names[j]))
+
+    rows = []
+
+    for metric in TEST_METRICS:
+        table = per_query_all.pivot(
+            index="qid", columns="model", values=metric
+        )
+
+        for a, b in pairs:
+            x = table[a].to_numpy()
+            y = table[b].to_numpy()
+            diff = x - y
+
+            if np.allclose(diff, 0):
+                p_value = np.nan
+            else:
+                p_value = float(wilcoxon(x, y).pvalue)
+
+            rows.append({
+                "metric": metric,
+                "model_A": a,
+                "model_B": b,
+                "mean_A": x.mean(),
+                "mean_B": y.mean(),
+                "mean_diff (A-B)": diff.mean(),
+                "queries_A_better": int((diff > 0).sum()),
+                "queries_B_better": int((diff < 0).sum()),
+                "queries_tied": int((diff == 0).sum()),
+                "p_value": p_value,
+                f"significant@{ALPHA}": (
+                    bool(p_value < ALPHA)
+                    if not np.isnan(p_value) else False
+                ),
+            })
+
+    return pd.DataFrame(rows)
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -290,6 +368,30 @@ def main():
     all_per_query = []
     all_ranked = []
 
+    def record(name, per_query, ranked):
+        all_per_query.append(per_query.assign(model=name))
+        all_ranked.append(ranked)
+
+        result = {"Model": name}
+        for metric in METRICS:
+            result[metric] = per_query[metric].mean()
+        summary.append(result)
+
+        print(
+            f"MAP: {result['MAP']:.4f} | "
+            f"MRR: {result['MRR']:.4f} | "
+            f"nDCG@10: {result['nDCG@10']:.4f}"
+        )
+
+    # ---- BM25 baseline ----
+    print(f"\nEvaluating {BASELINE_NAME} ({BASELINE_FEATURE})...")
+    baseline_scores = test_df[BASELINE_FEATURE].to_numpy(dtype=float)
+    per_query, ranked = evaluate_model(
+        test_df, baseline_scores, BASELINE_NAME
+    )
+    record(BASELINE_NAME, per_query, ranked)
+
+    # ---- Learned rankers ----
     for model_name, paths in MODELS.items():
 
         print(f"\nEvaluating {model_name}...")
@@ -315,34 +417,7 @@ def main():
         X_test = test_df[features].to_numpy(dtype=np.float32)
         scores = predict(model, X_test)
         per_query, ranked = evaluate_model(test_df, scores, model_name)
-
-        all_per_query.append(per_query.assign(model=model_name))
-        all_ranked.append(ranked)
-
-        metrics = [
-            "MAP",
-            "MRR",
-            "P@5",
-            "P@10",
-            "Recall@5",
-            "Recall@10",
-            "nDCG@5",
-            "nDCG@10",
-            "pairwise_accuracy"
-        ]
-
-        result = {"Model": model_name}
-
-        for metric in metrics:
-            result[metric] = per_query[metric].mean()
-
-        summary.append(result)
-
-        print(
-            f"MAP: {result['MAP']:.4f} | "
-            f"MRR: {result['MRR']:.4f} | "
-            f"nDCG@10: {result['nDCG@10']:.4f}"
-        )
+        record(model_name, per_query, ranked)
 
     comparison = pd.DataFrame(summary)
     comparison = comparison.sort_values(
@@ -357,7 +432,7 @@ def main():
     )
 
     print("\n" + "=" * 90)
-    print("FINAL MODEL COMPARISON")
+    print("FINAL MODEL COMPARISON (including BM25 baseline)")
     print("=" * 90)
 
     print(
@@ -367,10 +442,11 @@ def main():
         )
     )
 
-    best = comparison.iloc[0]
+    learned = comparison[comparison["Model"] != BASELINE_NAME]
+    best = learned.iloc[0]
 
     print("\n" + "=" * 90)
-    print("BEST MODEL")
+    print("BEST LEARNED MODEL (by test nDCG@10)")
     print("=" * 90)
 
     print(f"Model: {best['Model']}")
@@ -379,16 +455,39 @@ def main():
     print(f"Precision@10: {best['P@10']:.4f}")
     print(f"nDCG@10: {best['nDCG@10']:.4f}")
 
+    # ---- Paired Wilcoxon signed-rank tests ----
+    per_query_all = pd.concat(all_per_query, ignore_index=True)
+
+    tests = paired_wilcoxon_tests(per_query_all, list(MODELS.keys()))
+
+    print("\n" + "=" * 90)
+    print(f"PAIRED WILCOXON SIGNED-RANK TESTS "
+          f"(per-query, {test_df['qid'].nunique()} test queries)")
+    print("=" * 90)
+
+    print(
+        tests.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}"
+        )
+    )
+    print(
+        "\nNote: p-values are not corrected for multiple comparisons."
+    )
+
+    # ---- Save everything ----
     comparison.to_csv(
         OUTPUT_DIR / "model_comparison.csv",
         index=False
     )
 
-    pd.concat(
-        all_per_query,
-        ignore_index=True
-    ).to_csv(
+    per_query_all.to_csv(
         OUTPUT_DIR / "per_query_metrics.csv",
+        index=False
+    )
+
+    tests.to_csv(
+        OUTPUT_DIR / "significance_tests.csv",
         index=False
     )
 
